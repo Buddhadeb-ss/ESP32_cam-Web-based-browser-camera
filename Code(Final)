@@ -1,0 +1,320 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ==========================================
+// 1. SETTINGS
+// ==========================================
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// ==========================================
+// 2. PIN DEFINITIONS
+// ==========================================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#define FLASH_LED_PIN      4 
+
+httpd_handle_t camera_httpd = NULL;
+
+// ==========================================
+// 3. THE DASHBOARD INTERFACE (HTML/CSS/JS)
+// ==========================================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32-CAM Dashboard</title>
+  <style>
+    /* --- GENERAL STYLES --- */
+    body { font-family: 'Segoe UI', sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 0; text-align: center; }
+    h2 { margin-top: 15px; font-weight: 300; letter-spacing: 1px; color: #03dac6; }
+    
+    /* --- HEADER & CONTROLS --- */
+    .controls { padding: 20px; background-color: #1e1e1e; border-bottom: 1px solid #333; position: sticky; top: 0; z-index: 100; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    
+    button {
+      border: none; border-radius: 4px; padding: 12px 24px; 
+      font-size: 16px; font-weight: bold; cursor: pointer; transition: 0.2s;
+      text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    
+    .btn-capture { background-color: #bb86fc; color: #000; }
+    .btn-capture:active { background-color: #9965f4; transform: scale(0.98); }
+    
+    .btn-action { background-color: #03dac6; color: #000; margin: 5px; padding: 10px 15px; font-size: 14px; }
+    .btn-save { background-color: #cf6679; color: #fff; }
+
+    /* --- GALLERY GRID --- */
+    .gallery-container {
+      padding: 10px;
+      max-width: 800px;
+      margin: 0 auto;
+    }
+    
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr; /* 2 Columns */
+      gap: 15px;
+      margin-top: 20px;
+    }
+
+    .grid-item {
+      background-color: #1e1e1e;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+      position: relative;
+    }
+
+    .grid-item img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    /* --- MODAL (POPUP) --- */
+    #previewModal {
+      display: none; 
+      position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; 
+      background-color: rgba(0,0,0,0.95);
+      flex-direction: column; justify-content: center; align-items: center;
+    }
+    
+    #previewImgContainer {
+      margin-bottom: 20px;
+      border: 2px solid #333;
+      max-width: 90%;
+      max-height: 60vh;
+      overflow: hidden;
+      display: flex; justify-content: center; align-items: center;
+    }
+
+    #previewImg {
+      max-width: 100%; max-height: 60vh;
+      transition: transform 0.3s ease;
+    }
+
+    .modal-controls { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+
+  </style>
+</head>
+<body>
+
+  <div class="controls">
+    <h2>VISION DASHBOARD</h2>
+    <button class="btn-capture" onclick="capturePhoto()">SNAP PHOTO</button>
+  </div>
+
+  <div class="gallery-container">
+    <p style="color:#777; font-size: 12px;">Captured images are stored in this browser session.</p>
+    <div id="gallery" class="grid">
+      </div>
+  </div>
+
+  <div id="previewModal">
+    <h3 style="color:#fff">REVIEW CAPTURE</h3>
+    
+    <div id="previewImgContainer">
+      <img id="previewImg" src="">
+    </div>
+
+    <div class="modal-controls">
+      <button class="btn-action" onclick="rotateImage(-90)">↺ Left</button>
+      <button class="btn-action" onclick="rotateImage(90)">↻ Right</button>
+      <button class="btn-action btn-save" onclick="saveToGallery()">+ ADD TO DASHBOARD</button>
+      <button class="btn-action" style="background-color:#555; color:#fff" onclick="discardImage()">Discard</button>
+    </div>
+  </div>
+
+  <script>
+    let currentBlob = null;
+    let currentRotation = 0;
+
+    function capturePhoto() {
+      // Show loading state or text if you want
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/capture', true);
+      xhr.responseType = 'blob';
+      xhr.onload = function(e) {
+        if (this.status == 200) {
+          currentBlob = this.response;
+          openModal();
+        }
+      };
+      xhr.send();
+    }
+
+    function openModal() {
+      currentRotation = 0;
+      const img = document.getElementById('previewImg');
+      img.src = URL.createObjectURL(currentBlob);
+      img.style.transform = `rotate(0deg)`;
+      
+      document.getElementById('previewModal').style.display = 'flex';
+    }
+
+    function rotateImage(deg) {
+      currentRotation += deg;
+      const img = document.getElementById('previewImg');
+      img.style.transform = `rotate(${currentRotation}deg)`;
+    }
+
+    function discardImage() {
+      document.getElementById('previewModal').style.display = 'none';
+      currentBlob = null;
+    }
+
+    function saveToGallery() {
+      const gallery = document.getElementById('gallery');
+      
+      // Create Container
+      const div = document.createElement('div');
+      div.className = 'grid-item';
+
+      // Create Image
+      const img = document.createElement('img');
+      img.src = URL.createObjectURL(currentBlob);
+      
+      // Apply the rotation permanently to the style
+      img.style.transform = `rotate(${currentRotation}deg)`;
+      
+      // Fix visual spacing for rotated images (simple approach)
+      if (currentRotation % 180 !== 0) {
+         img.style.width = "auto";
+         img.style.height = "100%";
+         img.style.margin = "0 auto";
+      }
+
+      // Add timestamp (Optional)
+      // const info = document.createElement('div');
+      // info.innerText = new Date().toLocaleTimeString();
+      // info.style.padding = "5px"; info.style.fontSize = "10px";
+
+      div.appendChild(img);
+      // div.appendChild(info);
+      
+      // Add to top of grid
+      gallery.prepend(div);
+
+      // Close Modal
+      discardImage();
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ==========================================
+// 4. HANDLERS
+// ==========================================
+
+static esp_err_t index_handler(httpd_req_t *req){
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, index_html, strlen(index_html));
+}
+
+static esp_err_t capture_handler(httpd_req_t *req){
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+
+  digitalWrite(FLASH_LED_PIN, HIGH);
+  delay(150); // Slightly longer delay for auto-exposure
+  fb = esp_camera_fb_get();
+  digitalWrite(FLASH_LED_PIN, LOW);
+
+  if(!fb){
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+  res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  
+  esp_camera_fb_return(fb);
+  return res;
+}
+
+void startCameraServer(){
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  
+  httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL };
+  httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
+
+  if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(camera_httpd, &index_uri);
+    httpd_register_uri_handler(camera_httpd, &capture_uri);
+  }
+}
+
+// ==========================================
+// 5. SETUP
+// ==========================================
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
+  Serial.begin(115200);
+
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if(psramFound()){
+    config.frame_size = FRAMESIZE_UXGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  esp_camera_init(&config);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  
+  startCameraServer();
+  Serial.print("http://");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() { delay(10000); }
