@@ -19,5 +19,7 @@ a simple, standalone web server for the esp32-cam. i made this because the stand
 
 ## hardware
 * ESP32-CAM (AI-Thinker)
+* ESP32-MB board
 * 5V power supply
 * (that's it, no buttons needed)
+
